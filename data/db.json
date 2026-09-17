@@ -46,5 +46,31 @@
       "createdAt": "2026-06-16T00:00:00.000Z",
       "resolvedAt": null
     }
-  ]
+  ],
+  "stocks": [
+    {
+      "id": "roll_demo",
+      "kind": "roll",
+      "widthMm": 70,
+      "lengthMm": 50000,
+      "status": "sealed",
+      "sourceStockId": null,
+      "note": "示范整卷",
+      "createdAt": "2026-06-16T00:00:00.000Z",
+      "updatedAt": "2026-06-16T00:00:00.000Z"
+    },
+    {
+      "id": "offcut_demo_1",
+      "kind": "offcut",
+      "widthMm": 70,
+      "lengthMm": 1200,
+      "status": "available",
+      "sourceStockId": null,
+      "note": "示范边角料",
+      "createdAt": "2026-06-16T00:00:00.000Z",
+      "updatedAt": "2026-06-16T00:00:00.000Z"
+    }
+  ],
+  "allocations": [],
+  "scraps": []
 }
