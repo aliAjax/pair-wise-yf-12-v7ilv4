@@ -53,7 +53,29 @@ const initialData = {
       createdAt: new Date().toISOString(),
       resolvedAt: null
     }
-  ]
+  ],
+  stockPieces: [
+    {
+      id: "piece_demo_roll",
+      kind: "roll",
+      widthMm: 70,
+      lengthMm: 3000,
+      status: "available",
+      note: "新到半透明纸带整卷",
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: "piece_demo_remnant",
+      kind: "remnant",
+      widthMm: 70,
+      lengthMm: 450,
+      status: "available",
+      note: "上次裁剩的边角料",
+      createdAt: new Date().toISOString()
+    }
+  ],
+  allocations: [],
+  waste: []
 };
 
 const routes = [
@@ -67,7 +89,16 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /inventory/pieces",
+  "POST /inventory/pieces",
+  "GET /inventory/summary",
+  "GET /inventory/waste",
+  "GET /allocations",
+  "POST /allocations",
+  "POST /allocations/:id/start",
+  "POST /allocations/:id/cancel",
+  "POST /allocations/:id/complete"
 ];
 
 async function ensureDb() {
@@ -79,9 +110,16 @@ async function ensureDb() {
   }
 }
 
+function normalizeDb(data) {
+  for (const key of ["tunes", "sections", "issues", "stockPieces", "allocations", "waste"]) {
+    if (!Array.isArray(data[key])) data[key] = [];
+  }
+  return data;
+}
+
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  return normalizeDb(JSON.parse(await readFile(DB_FILE, "utf8")));
 }
 
 async function writeDb(data) {
@@ -132,6 +170,70 @@ function findTune(db, tuneId) {
     throw error;
   }
   return tune;
+}
+
+function positiveNumber(value, field) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) {
+    const error = new Error(`${field}必须是正数`);
+    error.status = 400;
+    throw error;
+  }
+  return num;
+}
+
+function findPiece(db, pieceId) {
+  const piece = db.stockPieces.find((item) => item.id === pieceId);
+  if (!piece) {
+    const error = new Error("库存料不存在");
+    error.status = 404;
+    throw error;
+  }
+  return piece;
+}
+
+function findAllocation(db, allocationId) {
+  const allocation = db.allocations.find((item) => item.id === allocationId);
+  if (!allocation) {
+    const error = new Error("申请不存在");
+    error.status = 404;
+    throw error;
+  }
+  return allocation;
+}
+
+// 选料：优先浪费最少的合格余料（长度富余最小），余料不够才开新卷（同样取最贴合的卷）
+function pickPiece(db, widthMm, lengthMm) {
+  const fits = (piece) => piece.status === "available" && piece.widthMm === widthMm && piece.lengthMm >= lengthMm;
+  const byLeastWaste = (a, b) => a.lengthMm - b.lengthMm || a.createdAt.localeCompare(b.createdAt);
+  const remnant = db.stockPieces.filter((p) => p.kind === "remnant" && fits(p)).sort(byLeastWaste)[0];
+  if (remnant) return remnant;
+  return db.stockPieces.filter((p) => p.kind === "roll" && fits(p)).sort(byLeastWaste)[0] || null;
+}
+
+function buildInventorySummary(db) {
+  const countBy = (items, key) =>
+    items.reduce((acc, item) => {
+      acc[item[key]] = (acc[item[key]] || 0) + 1;
+      return acc;
+    }, {});
+  const availableLength = (kind) =>
+    db.stockPieces
+      .filter((p) => p.kind === kind && p.status === "available")
+      .reduce((sum, p) => sum + p.lengthMm, 0);
+  return {
+    pieces: {
+      total: db.stockPieces.length,
+      byKind: countBy(db.stockPieces, "kind"),
+      byStatus: countBy(db.stockPieces, "status"),
+      availableLengthMm: { roll: availableLength("roll"), remnant: availableLength("remnant") }
+    },
+    allocations: { total: db.allocations.length, byStatus: countBy(db.allocations, "status") },
+    waste: {
+      total: db.waste.length,
+      totalLengthMm: db.waste.reduce((sum, item) => sum + item.lengthMm, 0)
+    }
+  };
 }
 
 function buildProgress(db, tuneId) {
@@ -269,6 +371,174 @@ async function handle(req, res) {
     issue.note = body.note ?? issue.note;
     await writeDb(db);
     return send(res, 200, { data: issue });
+  }
+
+  // ---------- 库存分配模块 ----------
+
+  if (req.method === "GET" && pathname === "/inventory/pieces") {
+    const kind = searchParams.get("kind");
+    const status = searchParams.get("status");
+    const widthMm = searchParams.get("widthMm");
+    const pieces = db.stockPieces.filter(
+      (item) =>
+        (!kind || item.kind === kind) &&
+        (!status || item.status === status) &&
+        (!widthMm || item.widthMm === Number(widthMm))
+    );
+    return send(res, 200, { data: pieces });
+  }
+
+  if (req.method === "POST" && pathname === "/inventory/pieces") {
+    const body = await parseBody(req);
+    required(body, ["kind", "widthMm", "lengthMm"]);
+    if (!["roll", "remnant"].includes(body.kind)) {
+      return send(res, 400, { error: "kind 必须是 roll（整卷）或 remnant（边角料）" });
+    }
+    const piece = {
+      id: makeId("piece"),
+      kind: body.kind,
+      widthMm: positiveNumber(body.widthMm, "宽度"),
+      lengthMm: positiveNumber(body.lengthMm, "长度"),
+      status: "available",
+      note: body.note || "",
+      createdAt: new Date().toISOString()
+    };
+    db.stockPieces.push(piece);
+    await writeDb(db);
+    return send(res, 201, { data: piece });
+  }
+
+  if (req.method === "GET" && pathname === "/inventory/summary") {
+    return send(res, 200, { data: buildInventorySummary(db) });
+  }
+
+  if (req.method === "GET" && pathname === "/inventory/waste") {
+    const tuneId = searchParams.get("tuneId");
+    const waste = db.waste.filter((item) => !tuneId || item.tuneId === tuneId);
+    return send(res, 200, { data: waste });
+  }
+
+  if (req.method === "GET" && pathname === "/allocations") {
+    const tuneId = searchParams.get("tuneId");
+    const status = searchParams.get("status");
+    const allocations = db.allocations.filter(
+      (item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status)
+    );
+    return send(res, 200, { data: allocations });
+  }
+
+  if (req.method === "POST" && pathname === "/allocations") {
+    const body = await parseBody(req);
+    required(body, ["tuneId", "widthMm", "lengthMm"]);
+    findTune(db, body.tuneId);
+    const widthMm = positiveNumber(body.widthMm, "宽度");
+    const lengthMm = positiveNumber(body.lengthMm, "长度");
+    const piece = pickPiece(db, widthMm, lengthMm);
+    if (!piece) {
+      return send(res, 409, { error: "没有宽度匹配且长度足够的余料或整卷" });
+    }
+    // 每首曲目独占一块完整料：余料整段保留给该曲目；整卷则裁下所需长度
+    if (piece.kind === "remnant") {
+      piece.status = "allocated";
+    } else {
+      piece.lengthMm -= lengthMm;
+      if (piece.lengthMm === 0) piece.status = "depleted";
+    }
+    const allocation = {
+      id: makeId("alloc"),
+      tuneId: body.tuneId,
+      widthMm,
+      lengthMm,
+      pieceId: piece.id,
+      sourceKind: piece.kind,
+      status: "allocated",
+      wasteMm: null,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      cancelledAt: null,
+      completedAt: null
+    };
+    db.allocations.push(allocation);
+    await writeDb(db);
+    return send(res, 201, { data: allocation });
+  }
+
+  const allocActionMatch = pathname.match(/^\/allocations\/([^/]+)\/(start|cancel|complete)$/);
+  if (allocActionMatch && req.method === "POST") {
+    const allocation = findAllocation(db, allocActionMatch[1]);
+    const action = allocActionMatch[2];
+    const piece = findPiece(db, allocation.pieceId);
+    const now = new Date().toISOString();
+
+    if (action === "start") {
+      if (allocation.status !== "allocated") {
+        return send(res, 409, { error: "只有未开工的申请才能开工" });
+      }
+      allocation.status = "in_progress";
+      allocation.startedAt = now;
+    }
+
+    if (action === "cancel") {
+      if (allocation.status === "allocated") {
+        // 未开工取消：原样回填，余料恢复可用，整卷退回裁下的长度
+        if (allocation.sourceKind === "remnant") {
+          piece.status = "available";
+        } else {
+          piece.lengthMm += allocation.lengthMm;
+          piece.status = "available";
+        }
+        allocation.status = "cancelled";
+        allocation.cancelledAt = now;
+      } else if (allocation.status === "in_progress") {
+        // 已开工取消：不回填库存，只记废料
+        const wasteMm = allocation.sourceKind === "remnant" ? piece.lengthMm : allocation.lengthMm;
+        if (allocation.sourceKind === "remnant") piece.status = "scrapped";
+        db.waste.push({
+          id: makeId("waste"),
+          allocationId: allocation.id,
+          tuneId: allocation.tuneId,
+          pieceId: piece.id,
+          widthMm: allocation.widthMm,
+          lengthMm: wasteMm,
+          reason: "开工后取消",
+          createdAt: now
+        });
+        allocation.status = "cancelled";
+        allocation.wasteMm = wasteMm;
+        allocation.cancelledAt = now;
+      } else {
+        return send(res, 409, { error: "已完成或已取消的申请不能取消" });
+      }
+    }
+
+    if (action === "complete") {
+      if (allocation.status !== "in_progress") {
+        return send(res, 409, { error: "只有已开工的申请才能完工" });
+      }
+      // 余料被整段占用，富余部分在完工时记为废料
+      if (allocation.sourceKind === "remnant") {
+        piece.status = "consumed";
+        const surplus = piece.lengthMm - allocation.lengthMm;
+        if (surplus > 0) {
+          db.waste.push({
+            id: makeId("waste"),
+            allocationId: allocation.id,
+            tuneId: allocation.tuneId,
+            pieceId: piece.id,
+            widthMm: allocation.widthMm,
+            lengthMm: surplus,
+            reason: "余料富余",
+            createdAt: now
+          });
+          allocation.wasteMm = surplus;
+        }
+      }
+      allocation.status = "completed";
+      allocation.completedAt = now;
+    }
+
+    await writeDb(db);
+    return send(res, 200, { data: allocation });
   }
 
   return send(res, 404, { error: "接口不存在", routes });

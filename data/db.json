@@ -46,5 +46,27 @@
       "createdAt": "2026-06-16T00:00:00.000Z",
       "resolvedAt": null
     }
-  ]
+  ],
+  "stockPieces": [
+    {
+      "id": "piece_demo_roll",
+      "kind": "roll",
+      "widthMm": 70,
+      "lengthMm": 3000,
+      "status": "available",
+      "note": "新到半透明纸带整卷",
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    },
+    {
+      "id": "piece_demo_remnant",
+      "kind": "remnant",
+      "widthMm": 70,
+      "lengthMm": 450,
+      "status": "available",
+      "note": "上次裁剩的边角料",
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    }
+  ],
+  "allocations": [],
+  "waste": []
 }
